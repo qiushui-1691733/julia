@@ -1079,11 +1079,14 @@ function apply_type_tfunc(@nospecialize(headtypetype), @nospecialize args...)
     if !istuple && !isa(headtype, UnionAll)
         return Union{}
     end
+    uw = unwrap_unionall(headtype)
+    isnamedtuple = isa(uw, DataType) && uw.name === _NAMEDTUPLE_NAME
     uncertain = false
     canconst = true
     tparams = Any[]
     outervars = Any[]
     varnamectr = 1
+    ua = headtype
     for i = 1:largs
         ai = widenconditional(args[i])
         if isType(ai)
@@ -1105,8 +1108,11 @@ function apply_type_tfunc(@nospecialize(headtypetype), @nospecialize args...)
             #    ai = rename_unionall(ai)
             #    unw = unwrap_unionall(ai)
             #end
+            ub = ai <: Type ? instanceof_tfunc(ai)[1] : Any
             if istuple
-                if i == largs
+                # in the last parameter of a Tuple type, if the upper bound is Any
+                # then this could be a Vararg type.
+                if i == largs && ub === Any
                     push!(tparams, Vararg)
                 # XXX
                 #elseif isT
@@ -1122,12 +1128,33 @@ function apply_type_tfunc(@nospecialize(headtypetype), @nospecialize args...)
             #        ai = ai.body
             #    end
             else
+                # Is this the second parameter to a NamedTuple?
+                if isnamedtuple && isa(ua, UnionAll) && uw.parameters[2] === ua.var
+                    # If the names are known, keep the upper bound (which we know is
+                    # at most Tuple), but otherwise widen to Tuple.
+                    # This is a widening heuristic to avoid keeping type information
+                    # that's unlikely to be useful.
+                    if uw.parameters[1] isa Tuple || (i == 2 && tparams[1] isa Tuple)
+                        if ub >: Tuple
+                            ub = Tuple
+                        end
+                    else
+                        ub = Tuple
+                    end
+                else
+                    ub = Any
+                end
                 tvname = varnamectr <= length(_tvarnames) ? _tvarnames[varnamectr] : :_Z
                 varnamectr += 1
-                v = TypeVar(tvname)
+                v = TypeVar(tvname, ub)
                 push!(tparams, v)
                 push!(outervars, v)
             end
+        end
+        if isa(ua, UnionAll)
+            ua = ua.body
+        else
+            ua = nothing
         end
     end
     local appl

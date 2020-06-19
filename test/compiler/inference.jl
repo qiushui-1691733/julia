@@ -2649,3 +2649,10 @@ end
 f(n) = depth(n, 1)
 end
 @test Base.return_types(TestConstPropRecursion.f, (TestConstPropRecursion.Node,)) == Any[Int]
+
+# issue #32699
+f32699(a) = (id = a[1],).id
+@test Base.return_types(f32699, (Vector{Union{Int,Missing}},)) == Any[Union{Int,Missing}]
+g32699(a) = Tuple{a}
+@test Base.return_types(g32699, (Type{<:Integer},))[1] == Type{<:Tuple{Any}}
+@test Base.return_types(g32699, (Type,))[1] == Type{<:Tuple}
