@@ -1246,9 +1246,87 @@ static int check_shadowed_visitor(jl_typemap_entry_t *oldentry, struct typemap_i
     return 1;
 }
 
+static jl_value_t *typejoin_ttype(jl_value_t *type)
+{
+    if (jl_is_typevar(type)) {
+        jl_value_t *ub = ((jl_tvar_t*)type)->ub;
+        jl_value_t *newub = typejoin_ttype(ub);
+        if (newub != ub || ((jl_tvar_t*)type)->lb != jl_bottom_type) {
+            JL_GC_PUSH1(&newub);
+            type = (jl_value_t*)jl_new_typevar(((jl_tvar_t*)type)->name, jl_bottom_type, ub);
+            JL_GC_POP();
+        }
+    }
+    else if (jl_is_unionall(type)) {
+        jl_value_t *body = ((jl_unionall_t*)type)->body;
+        jl_value_t *uw = jl_unwrap_unionall(body);
+        if (jl_is_datatype(uw) && ((jl_datatype_t*)uw)->name->wrapper == type)
+            return type;
+        jl_tvar_t *var = ((jl_unionall_t*)type)->var;
+        jl_value_t *newbody = typejoin_ttype(body);
+        if (body != newbody) {
+            uw = jl_unwrap_unionall(newbody);
+            if (jl_is_datatype(uw) && ((jl_datatype_t*)uw)->name->wrapper == newbody)
+                return newbody;
+        }
+        jl_value_t *newvar = NULL;
+        JL_GC_PUSH3(&newbody, &newvar, &type);
+        if (body != newbody) {
+            type = jl_type_unionall(var, newbody);
+        }
+        if (jl_is_unionall(type)) {
+            newvar = typejoin_ttype((jl_value_t*)var);
+            if ((jl_value_t*)var != newvar) {
+                type = jl_apply_type1(type, newvar);
+                if (jl_is_typevar(newvar))
+                    type = jl_new_struct(jl_unionall_type, newvar, type);
+            }
+        }
+        JL_GC_POP();
+    }
+    else if (jl_is_uniontype(type)) {
+        type = (jl_value_t*)jl_any_type; // TODO: something like least common ancestor?
+    }
+    else if (jl_is_datatype(type)) {
+        if (((jl_datatype_t*)(type))->name == jl_vararg_typename) {
+            jl_value_t *t = jl_tparam(type, 0);
+            jl_value_t *n = jl_tparam(type, 1);
+            jl_value_t *newt = NULL;
+            jl_value_t *newn = NULL;
+            JL_GC_PUSH2(&newt, &newn);
+            newt = typejoin_ttype(t);
+            newn = typejoin_ttype(n);
+            if (t != newt || n != newn)
+                type = jl_wrap_vararg(newt, newn);
+            JL_GC_POP();
+        }
+        else if (jl_is_tuple_type(type)) {
+            jl_svec_t *newparams = NULL;
+            jl_value_t *newelt = NULL;
+            JL_GC_PUSH2(&newparams, &newelt);
+            size_t i, np = jl_nparams(type);
+            for (i = 0; i < np; i++) {
+                jl_value_t *elt = jl_tparam(type, i);
+                newelt = typejoin_ttype(elt);
+                if (elt != newelt) {
+                    if (!newparams) newparams = jl_svec_copy(((jl_datatype_t*)type)->parameters);
+                    jl_svecset(newparams, i, newelt);
+                }
+            }
+            if (newparams)
+                type = (jl_value_t*)jl_apply_tuple_type(newparams);
+            JL_GC_POP();
+        }
+        //else if (!((jl_datatype_t*)type)->isconcretetype) {
+        //    type = ((jl_datatype_t*)type)->name->wrapper;
+        //}
+    }
+    return type;
+}
+
 static jl_value_t *check_shadowed_matches(jl_typemap_t *defs, jl_typemap_entry_t *newentry)
 {
-    jl_tupletype_t *type = newentry->sig;
+    jl_tupletype_t *type = (jl_tupletype_t*)typejoin_ttype((jl_value_t*)newentry->sig);
     jl_tupletype_t *ttypes = (jl_tupletype_t*)jl_unwrap_unionall((jl_value_t*)type);
     size_t l = jl_nparams(ttypes);
     jl_value_t *va = NULL;
@@ -1264,7 +1342,7 @@ static jl_value_t *check_shadowed_matches(jl_typemap_t *defs, jl_typemap_entry_t
     env.match.env = jl_emptysvec;
     env.newentry = newentry;
     env.shadowed = NULL;
-    JL_GC_PUSH3(&env.match.env, &env.match.ti, &env.shadowed);
+    JL_GC_PUSH4(&type, &env.match.env, &env.match.ti, &env.shadowed);
     jl_typemap_intersection_visitor(defs, 0, &env.match);
     JL_GC_POP();
     return env.shadowed;
@@ -1445,6 +1523,7 @@ struct invalidate_mt_env {
 static int invalidate_mt_cache(jl_typemap_entry_t *oldentry, void *closure0)
 {
     struct invalidate_mt_env *env = (struct invalidate_mt_env*)closure0;
+    JL_GC_PROMISE_ROOTED(env->newentry);
     if (oldentry->max_world == ~(size_t)0) {
         jl_method_instance_t *mi = oldentry->func.linfo;
         jl_method_t *m = mi->def.method;
