@@ -1181,6 +1181,95 @@ void print_func_loc(JL_STREAM *s, jl_method_t *m)
     }
 }
 
+struct shadowed_matches_env {
+    struct typemap_intersection_env match;
+    jl_typemap_entry_t *newentry;
+    jl_value_t *shadowed;
+};
+static int check_shadowed_visitor(jl_typemap_entry_t *oldentry, struct typemap_intersection_env *closure0)
+{
+    struct shadowed_matches_env *closure = container_of(closure0, struct shadowed_matches_env, match);
+    if (oldentry == closure->newentry)
+        return 1;
+    if (oldentry->max_world < ~(size_t)0 || oldentry->min_world == closure->newentry->min_world)
+        // skip if no world has both active
+        // also be careful not to try to scan something from the current dump-reload though
+        return 1;
+    jl_method_t *oldmethod = oldentry->func.method;
+    if (oldmethod->specializations == jl_emptysvec)
+        // nothing inferred ever before means nothing shadowed ever before
+        return 1;
+
+    jl_tupletype_t *type = closure->newentry->sig;
+    jl_tupletype_t *sig = oldentry->sig;
+
+    int shadowed = 0;
+    if (closure->match.issubty) { // (new)type <: match <: (old)sig
+        // new entry is more specific
+        shadowed = 1;
+    }
+    else if (jl_subtype((jl_value_t*)sig, (jl_value_t*)type)) {
+        // old entry is more specific
+    }
+    else if (type != (jl_tupletype_t*)closure->match.type && jl_subtype((jl_value_t*)type, (jl_value_t*)sig)) { // (new)type <: (old)sig
+        // new entry is more specific
+        shadowed = 1;
+    }
+    else if (jl_type_morespecific_no_subtype((jl_value_t*)type, (jl_value_t*)sig)) {
+        // new entry is more specific
+        shadowed = 1;
+    }
+    else if (jl_type_morespecific_no_subtype((jl_value_t*)sig, (jl_value_t*)type)) {
+        // old entry is more specific
+    }
+    else {
+        // sort order is ambiguous
+        shadowed = 1;
+    }
+
+    // ok: record that this method definition is being partially replaced
+    // (either with a real definition, or an ambiguity error)
+    if (shadowed) {
+        if (closure->shadowed == NULL) {
+            closure->shadowed = (jl_value_t*)oldmethod;
+        }
+        else if (!jl_is_array(closure->shadowed)) {
+            jl_array_t *list = jl_alloc_vec_any(2);
+            jl_array_ptr_set(list, 0, closure->shadowed);
+            jl_array_ptr_set(list, 1, (jl_value_t*)oldmethod);
+            closure->shadowed = (jl_value_t*)list;
+        }
+        else {
+            jl_array_ptr_1d_push((jl_array_t*)closure->shadowed, (jl_value_t*)oldmethod);
+        }
+    }
+    return 1;
+}
+
+static jl_value_t *check_shadowed_matches(jl_typemap_t *defs, jl_typemap_entry_t *newentry)
+{
+    jl_tupletype_t *type = newentry->sig;
+    jl_tupletype_t *ttypes = (jl_tupletype_t*)jl_unwrap_unionall((jl_value_t*)type);
+    size_t l = jl_nparams(ttypes);
+    jl_value_t *va = NULL;
+    if (l > 0) {
+        va = jl_tparam(ttypes, l - 1);
+        if (jl_is_vararg_type(va))
+            va = jl_unwrap_vararg(va);
+        else
+            va = NULL;
+    }
+    struct shadowed_matches_env env = {{check_shadowed_visitor, (jl_value_t*)type, va}};
+    env.match.ti = NULL;
+    env.match.env = jl_emptysvec;
+    env.newentry = newentry;
+    env.shadowed = NULL;
+    JL_GC_PUSH3(&env.match.env, &env.match.ti, &env.shadowed);
+    jl_typemap_intersection_visitor(defs, 0, &env.match);
+    JL_GC_POP();
+    return env.shadowed;
+}
+
 
 static void method_overwrite(jl_typemap_entry_t *newentry, jl_method_t *oldvalue)
 {
@@ -1349,6 +1438,7 @@ JL_DLLEXPORT void jl_method_table_add_backedge(jl_methtable_t *mt, jl_value_t *t
 
 struct invalidate_mt_env {
     jl_typemap_entry_t *newentry;
+    jl_value_t *shadowed;
     size_t max_world;
     int invalidated;
 };
@@ -1357,31 +1447,34 @@ static int invalidate_mt_cache(jl_typemap_entry_t *oldentry, void *closure0)
     struct invalidate_mt_env *env = (struct invalidate_mt_env*)closure0;
     if (oldentry->max_world == ~(size_t)0) {
         jl_method_instance_t *mi = oldentry->func.linfo;
-        int intersects = !jl_has_empty_intersection(mi->specTypes, (jl_value_t*)env->newentry->sig);
-        if (intersects) {
-            invalidate_backedges(mi, env->max_world, "invalidate_mt_cache");
-            oldentry->max_world = env->max_world;
-            env->invalidated = 1;
+        jl_method_t *m = mi->def.method;
+        int intersects = 0;
+        if (jl_is_method(env->shadowed)) {
+            if ((jl_value_t*)m == env->shadowed) {
+                intersects = 1;
+            }
         }
-    }
-    return 1;
-}
-static int invalidate_meth_specs(jl_typemap_entry_t *oldentry, void *closure0)
-{
-    struct invalidate_mt_env *env = (struct invalidate_mt_env*)closure0;
-    if (oldentry == env->newentry)
-        return 1;
-    if (oldentry->max_world < ~(size_t)0)
-        return 1; // no world has both active
-
-    jl_method_t *m = oldentry->func.method;
-    jl_svec_t *specializations = jl_atomic_load_acquire(&m->specializations);
-    jl_method_instance_t **data = (jl_method_instance_t**)jl_svec_data(specializations);
-    size_t i, l = jl_svec_len(specializations);
-    for (i = 0; i < l; i++) {
-        jl_method_instance_t *mi = jl_atomic_load_relaxed(&data[i]);
-        if (mi != NULL && mi->backedges && !jl_has_empty_intersection((jl_value_t*)mi->specTypes, (jl_value_t*)env->newentry->sig)) {
-            invalidate_backedges(mi, env->max_world, "jl_method_table_insert");
+        else {
+            assert(jl_is_array(env->shadowed));
+            jl_method_t **d = (jl_method_t**)jl_array_ptr_data(env->shadowed);
+            size_t i, n = jl_array_len(env->shadowed);
+            for (i = 0; i < n; i++) {
+                if (m == d[i]) {
+                    intersects = 1;
+                    break;
+                }
+            }
+        }
+        intersects = intersects && !jl_has_empty_intersection((jl_value_t*)oldentry->sig, (jl_value_t*)env->newentry->sig);
+        if (intersects) {
+            if (_jl_debug_method_invalidation) {
+                jl_array_ptr_1d_push(_jl_debug_method_invalidation, (jl_value_t*)oldentry);
+                jl_value_t *loctag = jl_cstr_to_string("invalidate_mt_cache");
+                JL_GC_PUSH1(&loctag);
+                jl_array_ptr_1d_push(_jl_debug_method_invalidation, loctag);
+                JL_GC_POP();
+            }
+            oldentry->max_world = env->max_world;
             env->invalidated = 1;
         }
     }
@@ -1433,14 +1526,15 @@ JL_DLLEXPORT void jl_method_table_disable(jl_methtable_t *mt, jl_method_t *metho
     struct invalidate_mt_env mt_cache_env;
     mt_cache_env.max_world = methodentry->max_world - 1;
     mt_cache_env.newentry = methodentry;
+    mt_cache_env.shadowed = NULL;
     mt_cache_env.invalidated = 0;
     jl_typemap_visitor(mt->cache, disable_mt_cache, (void*)&mt_cache_env);
     jl_array_t *leafcache = mt->leafcache;
     size_t i, l = jl_array_len(leafcache);
     for (i = 1; i < l; i += 2) {
-        jl_value_t *l = jl_array_ptr_ref(leafcache, i);
-        if (l && l != jl_nothing)
-            invalidate_mt_cache((jl_typemap_entry_t*)l, (void*)&mt_cache_env);
+        jl_typemap_entry_t *oldentry = (jl_typemap_entry_t*)jl_array_ptr_ref(leafcache, i);
+        if (l && (jl_value_t*)l != jl_nothing && oldentry->max_world < ~(size_t)0)
+            oldentry->max_world = mt_cache_env.max_world;
     }
     // Invalidate the backedges
     int invalidated = 0;
@@ -1469,13 +1563,14 @@ JL_DLLEXPORT void jl_method_table_insert(jl_methtable_t *mt, jl_method_t *method
     assert(jl_is_method(method));
     assert(jl_is_mtable(mt));
     jl_value_t *type = method->sig;
+    jl_value_t *oldvalue = NULL;
     if (method->primary_world == 1)
         method->primary_world = ++jl_world_counter;
     size_t max_world = method->primary_world - 1;
     int invalidated = 0;
     jl_value_t *loctag = NULL;  // debug info for invalidation
     jl_typemap_entry_t *newentry = NULL;
-    JL_GC_PUSH2(&newentry, &loctag);
+    JL_GC_PUSH3(&oldvalue, &newentry, &loctag);
     JL_LOCK(&mt->writelock);
     // first delete the existing entry (we'll disable it later)
     struct jl_typemap_assoc search = {(jl_value_t*)type, method->primary_world, NULL, 0, ~(size_t)0};
@@ -1488,32 +1583,11 @@ JL_DLLEXPORT void jl_method_table_insert(jl_methtable_t *mt, jl_method_t *method
     newentry = jl_typemap_alloc((jl_tupletype_t*)type, simpletype, jl_emptysvec,
             (jl_value_t*)method, method->primary_world, method->deleted_world);
     jl_typemap_insert(&mt->defs, (jl_value_t*)mt, newentry, 0, &method_defs);
-    // drop anything in mt->cache that might overlap with the new method
-    struct invalidate_mt_env mt_cache_env;
-    mt_cache_env.max_world = max_world;
-    mt_cache_env.invalidated = 0;
     if (oldentry) {
-        method_overwrite(newentry, oldentry->func.method);
-        // aka method_table_disable(old)
-        mt_cache_env.newentry = oldentry;
-        jl_typemap_visitor(mt->cache, disable_mt_cache, (void*)&mt_cache_env);
-        jl_array_t *leafcache = mt->leafcache;
-        size_t i, l = jl_array_len(leafcache);
-        for (i = 1; i < l; i += 2) {
-            jl_value_t *l = jl_array_ptr_ref(leafcache, i);
-            if (l && l != jl_nothing)
-                disable_mt_cache((jl_typemap_entry_t*)l, (void*)&mt_cache_env);
-        }
-        jl_svec_t *specializations = oldentry->func.method->specializations;
-        l = jl_svec_len(specializations);
-        for (i = 0; i < l; i++) {
-            jl_method_instance_t *mi = (jl_method_instance_t*)jl_svecref(specializations, i);
-            if (mi)
-                invalidate_backedges(mi, max_world, NULL);
-        }
+        oldvalue = oldentry->func.value;
+        method_overwrite(newentry, (jl_method_t*)oldvalue);
     }
     else {
-        mt_cache_env.newentry = newentry;
         if (mt->backedges) {
             jl_value_t **backedges = jl_array_ptr_data(mt->backedges);
             size_t i, na = jl_array_len(mt->backedges);
@@ -1521,6 +1595,7 @@ JL_DLLEXPORT void jl_method_table_insert(jl_methtable_t *mt, jl_method_t *method
             for (i = 1; i < na; i += 2) {
                 jl_value_t *backedgetyp = backedges[i - 1];
                 if (!jl_has_empty_intersection(backedgetyp, (jl_value_t*)type)) {
+                    // TODO: only delete if the ml_matches list (with intersection=0, include_ambiguous=1) is empty
                     jl_method_instance_t *backedge = (jl_method_instance_t*)backedges[i];
                     invalidate_method_instance(backedge, max_world, 0);
                     invalidated = 1;
@@ -1537,6 +1612,18 @@ JL_DLLEXPORT void jl_method_table_insert(jl_methtable_t *mt, jl_method_t *method
             else
                 jl_array_del_end(mt->backedges, na - ins);
         }
+
+        oldvalue = check_shadowed_matches(mt->defs, newentry);
+    }
+
+    if (oldvalue) {
+        // drop anything in mt->cache that might overlap with the new method
+        struct invalidate_mt_env mt_cache_env;
+        mt_cache_env.max_world = max_world;
+        mt_cache_env.shadowed = oldvalue;
+        mt_cache_env.newentry = newentry;
+        mt_cache_env.invalidated = 0;
+
         jl_typemap_visitor(mt->cache, invalidate_mt_cache, (void*)&mt_cache_env);
         jl_array_t *leafcache = mt->leafcache;
         size_t i, l = jl_array_len(leafcache);
@@ -1545,13 +1632,31 @@ JL_DLLEXPORT void jl_method_table_insert(jl_methtable_t *mt, jl_method_t *method
             if (l && l != jl_nothing)
                 invalidate_mt_cache((jl_typemap_entry_t*)l, (void*)&mt_cache_env);
         }
-        //TODO: if it's small, might it be better to drop it all?
-        //if (mt != jl_type_type_mt) {
-        //    mt->cache = jl_nothing;
-        //    mt->leafcache = jl_an_empty_vec_any;
-        //}
-        jl_typemap_visitor(mt->defs, invalidate_meth_specs, (void*)&mt_cache_env);
-        invalidated = invalidated || mt_cache_env.invalidated;
+
+        jl_value_t **d;
+        size_t j, n;
+        if (jl_is_method(oldvalue)) {
+            d = &oldvalue;
+            n = 1;
+        }
+        else {
+            assert(jl_is_array(oldvalue));
+            d = jl_array_ptr_data(oldvalue);
+            n = jl_array_len(oldvalue);
+        }
+        for (j = 0; j < n; j++) {
+            jl_value_t *m = d[j];
+            jl_svec_t *specializations = jl_atomic_load_acquire(&((jl_method_t*)m)->specializations);
+            jl_method_instance_t **data = (jl_method_instance_t**)jl_svec_data(specializations);
+            size_t i, l = jl_svec_len(specializations);
+            for (i = 0; i < l; i++) {
+                jl_method_instance_t *mi = jl_atomic_load_relaxed(&data[i]);
+                if (mi != NULL && mi->backedges && !jl_has_empty_intersection(type, (jl_value_t*)mi->specTypes)) {
+                    invalidate_backedges(mi, max_world, "jl_method_table_insert");
+                    invalidated = 1;
+                }
+            }
+        }
     }
     if (invalidated && _jl_debug_method_invalidation) {
         jl_array_ptr_1d_push(_jl_debug_method_invalidation, (jl_value_t*)method);
@@ -1559,8 +1664,8 @@ JL_DLLEXPORT void jl_method_table_insert(jl_methtable_t *mt, jl_method_t *method
         jl_array_ptr_1d_push(_jl_debug_method_invalidation, loctag);
     }
     update_max_args(mt, type);
-    JL_GC_POP();
     JL_UNLOCK(&mt->writelock);
+    JL_GC_POP();
 }
 
 static void JL_NORETURN jl_method_error_bare(jl_function_t *f, jl_value_t *args, size_t world)
