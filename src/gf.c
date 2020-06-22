@@ -1612,7 +1612,7 @@ JL_DLLEXPORT void jl_method_table_disable(jl_methtable_t *mt, jl_method_t *metho
     size_t i, l = jl_array_len(leafcache);
     for (i = 1; i < l; i += 2) {
         jl_typemap_entry_t *oldentry = (jl_typemap_entry_t*)jl_array_ptr_ref(leafcache, i);
-        if (l && (jl_value_t*)l != jl_nothing && oldentry->max_world < ~(size_t)0)
+        if (oldentry && (jl_value_t*)oldentry != jl_nothing && oldentry->max_world == ~(size_t)0)
             oldentry->max_world = mt_cache_env.max_world;
     }
     // Invalidate the backedges
