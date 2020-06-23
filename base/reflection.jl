@@ -834,6 +834,16 @@ function _methods(@nospecialize(f), @nospecialize(t), lim::Int, world::UInt)
     return _methods_by_ftype(tt, lim, world)
 end
 
+function _methods_ft(@nospecialize(ft::Type), @nospecialize(args), lim::Int, world::UInt)
+    if isa(args, Type)
+        u = unwrap_unionall(args)
+        tt = rewrap_unionall(Tuple{ft, u.parameters...}, args)
+    else
+        tt = Tuple{ft, args...}
+    end
+    return _methods_by_ftype(tt, lim, world)
+end
+
 function _methods_by_ftype(@nospecialize(t), lim::Int, world::UInt)
     return _methods_by_ftype(t, lim, world, UInt[typemin(UInt)], UInt[typemax(UInt)])
 end
@@ -1081,10 +1091,18 @@ function code_typed(@nospecialize(f), @nospecialize(types=Tuple);
                     debuginfo::Symbol=:default,
                     world = get_world_counter(),
                     interp = Core.Compiler.NativeInterpreter(world))
-    ccall(:jl_is_in_pure_context, Bool, ()) && error("code reflection cannot be used from generated functions")
     if isa(f, Core.Builtin)
         throw(ArgumentError("argument is not a generic function"))
     end
+    return code_typed_ftype(Core.Typeof(f), types; optimize, debuginfo, world, interp)
+end
+
+function code_typed_ftype(@nospecialize(ft), @nospecialize(types=Tuple);
+                          optimize=true,
+                          debuginfo::Symbol=:default,
+                          world = get_world_counter(),
+                          interp = Core.Compiler.NativeInterpreter(world))
+    ccall(:jl_is_in_pure_context, Bool, ()) && error("code reflection cannot be used from generated functions")
     if @isdefined(IRShow)
         debuginfo = IRShow.debuginfo(debuginfo)
     elseif debuginfo === :default
@@ -1095,7 +1113,11 @@ function code_typed(@nospecialize(f), @nospecialize(types=Tuple);
     end
     types = to_tuple_type(types)
     asts = []
-    for x in _methods(f, types, -1, world)
+    meths = _methods_ft(ft, types, -1, world)
+    if meths === false
+        error("function type does not correspond to a generic function")
+    end
+    for x in meths
         meth = func_for_method_checked(x[3], types, x[2])
         (code, ty) = Core.Compiler.typeinf_code(interp, meth, x[1], x[2], optimize)
         code === nothing && error("inference not successful") # inference disabled?

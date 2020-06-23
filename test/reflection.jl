@@ -525,6 +525,10 @@ let
     @test !isdefined(mi.cache, :next)
 end
 
+# code_typed_ftype
+@test Base.code_typed_ftype(Type{<:Val}, ())[1][2] == Val
+@test_throws ErrorException("function type does not correspond to a generic function") Base.code_typed_ftype(Any, ())
+
 # New reflection methods in 0.6
 struct ReflectionExample{T<:AbstractFloat, N}
     x::Tuple{T, N}
